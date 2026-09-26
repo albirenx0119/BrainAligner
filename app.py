@@ -1,10 +1,12 @@
 from __future__ import annotations
-import io, json, uuid, zipfile
+import io, json, re, uuid, zipfile
+import base64
 from pathlib import Path
 from typing import Any
 import cv2
 import numpy as np
 import tifffile
+from registration import register_stack
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +15,9 @@ from pydantic import BaseModel
 ROOT = Path(__file__).parent
 DATA: dict[str, dict[str, Any]] = {}
 app = FastAPI(title='BrainAligner')
+
+def natural_key(value: str):
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r'(\d+)', value)]
 
 def to_zcyx(arr: np.ndarray, axes: str) -> np.ndarray:
     axes = axes.upper()
@@ -53,14 +58,16 @@ async def upload(file: UploadFile = File(...)):
             series = tf.series[0]; data = to_zcyx(series.asarray(), series.axes); axes = series.axes
     except Exception as e: raise HTTPException(400, f'TIFFを読み込めません: {e}')
     if data.shape[0] * data.shape[1] > 1000: raise HTTPException(400, 'スライス数×チャンネル数が大きすぎます')
-    sid = str(uuid.uuid4()); s = {'id': sid, 'name': Path(file.filename).name, 'data': data, 'dtype': str(data.dtype), 'axes': axes, 'originalShape': list(data.shape)}; DATA[sid] = s
+    h, w = data.shape[2:]
+    masks = np.ones((data.shape[0], h, w), dtype=np.uint8)
+    sid = str(uuid.uuid4()); s = {'id': sid, 'name': Path(file.filename).name, 'data': data, 'masks': masks, 'dtype': str(data.dtype), 'sliceDtypes': [str(data.dtype)] * data.shape[0], 'axes': axes, 'originalShape': list(data.shape)}; DATA[sid] = s
     return info(s)
 
 @app.post('/api/upload-folder')
 async def upload_folder(files: list[UploadFile] = File(...)):
     """Load TIFFs chosen from one directory and concatenate them as serial sections."""
     if not files: raise HTTPException(400, 'フォルダ内にTIFFファイルがありません')
-    files = sorted((f for f in files if f.filename.lower().endswith(('.tif', '.tiff'))), key=lambda f: f.filename.lower())
+    files = sorted((f for f in files if f.filename.lower().endswith(('.tif', '.tiff'))), key=lambda f: natural_key(f.filename.replace('\\', '/')))
     if not files: raise HTTPException(400, '選択したフォルダにTIFFファイルがありません')
     if len(files) > 1000: raise HTTPException(413, 'フォルダ内のTIFFは1000ファイル以下にしてください')
     arrays = []; axes_seen = []
@@ -81,17 +88,22 @@ async def upload_folder(files: list[UploadFile] = File(...)):
     # Promote to a shared dtype and center each image on a common canvas.
     max_h = max(a.shape[2] for a in arrays); max_w = max(a.shape[3] for a in arrays)
     dtype = np.result_type(*(a.dtype for a in arrays))
-    padded = []
+    padded = []; masks = []
     for a in arrays:
         canvas = np.zeros((a.shape[0], a.shape[1], max_h, max_w), dtype=dtype)
+        mask = np.zeros((a.shape[0], max_h, max_w), dtype=np.uint8)
         top = (max_h - a.shape[2]) // 2; left = (max_w - a.shape[3]) // 2
         canvas[:, :, top:top+a.shape[2], left:left+a.shape[3]] = a
+        mask[:, top:top+a.shape[2], left:left+a.shape[3]] = 1
         padded.append(canvas)
+        masks.append(mask)
     data = np.concatenate(padded, axis=0)
+    support = np.concatenate(masks, axis=0)
     if data.shape[0] * data.shape[1] > 1000: raise HTTPException(400, 'スライス数×チャンネル数が大きすぎます')
     name = Path(files[0].filename.replace('\\', '/')).parent.name or 'folder-stack'
     sid = str(uuid.uuid4())
-    s = {'id': sid, 'name': f'{name} ({len(files)} files)', 'data': data, 'dtype': str(data.dtype),
+    slice_dtypes = [str(a.dtype) for a in arrays for _ in range(a.shape[0])]
+    s = {'id': sid, 'name': f'{name} ({len(files)} files)', 'data': data, 'masks': support, 'dtype': str(data.dtype), 'sliceDtypes': slice_dtypes,
          'axes': 'folder:' + ','.join(axes_seen), 'originalShape': list(data.shape),
          'sourceFiles': [Path(f.filename.replace('\\', '/')).name for f in files]}
     DATA[sid] = s
@@ -101,31 +113,33 @@ class AlignRequest(BaseModel):
     id: str
     reference_slice: int = 0
     channel: int = 0
-    max_dimension: int = 1400
+    max_dimension: int = 768
 
 @app.post('/api/align')
 def align(req: AlignRequest):
     if req.id not in DATA: raise HTTPException(404, '画像セッションがありません')
     s = DATA[req.id]; src = s['data']; z, c, h, w = src.shape
     if not (0 <= req.reference_slice < z and 0 <= req.channel < c): raise HTTPException(400, 'スライスまたはチャンネルが範囲外です')
-    factor = min(1, req.max_dimension / max(h, w)); nh, nw = max(8, round(h*factor)), max(8, round(w*factor))
-    def prep(im):
-        out = display8(im)
-        if (nh, nw) != out.shape: out = cv2.resize(out, (nw, nh), interpolation=cv2.INTER_AREA)
-        return cv2.GaussianBlur(out.astype(np.float32) / 255, (0, 0), 1.2)
-    ref_idx = req.reference_slice; ref = prep(src[ref_idx, req.channel]); aligned = np.empty_like(src); transforms = []
-    for i in range(z):
-        if i == ref_idx: mat = np.eye(2, 3, dtype=np.float32); score = 1.0
-        else:
-            mat = np.eye(2, 3, dtype=np.float32)
-            try: score, mat = cv2.findTransformECC(ref, prep(src[i, req.channel]), mat, cv2.MOTION_EUCLIDEAN, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 250, 1e-6), None, 5)
-            except cv2.error: score = 0.0
-        fullmat = mat.copy(); fullmat[0, 2] /= factor; fullmat[1, 2] /= factor
-        transforms.append({'slice': i, 'matrix': fullmat.tolist(), 'score': float(score)})
-        for ch in range(c): aligned[i, ch] = cv2.warpAffine(src[i, ch], fullmat, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    if req.max_dimension not in (512, 768, 1024, 1536): raise HTTPException(400, 'Proxy size must be 512, 768, 1024, or 1536.')
+    ref_idx = req.reference_slice
+    matrices, transforms, failed, factor = register_stack(src[:, req.channel], s['masks'], ref_idx, req.max_dimension, s['sliceDtypes'])
+    aligned = np.empty_like(src)
+    for i, matrix in enumerate(matrices):
+        affine = np.array([[matrix[0], matrix[2], matrix[4]], [matrix[1], matrix[3], matrix[5]]], dtype=np.float32)
+        for ch in range(c):
+            aligned[i, ch] = cv2.warpAffine(src[i, ch], affine, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     s['aligned'] = aligned; s['transforms'] = transforms; s['reference'] = ref_idx; s['channel'] = req.channel
     picks = sorted(set([0, ref_idx, min(z-1, ref_idx+1)]))
-    return {'id': req.id, 'transforms': transforms, 'alignedPreviews': [{'slice': i, 'channels': [png_data(aligned[i, ch]) for ch in range(c)]} for i in picks], 'reference': ref_idx, 'channel': req.channel}
+    return {'id': req.id, 'transforms': transforms, 'failedSlices': failed, 'proxyScale': factor, 'alignedPreviews': [{'slice': i, 'channels': [png_data(aligned[i, ch]) for ch in range(c)]} for i in picks], 'reference': ref_idx, 'channel': req.channel}
+
+@app.get('/api/preview/{sid}/{slice_index}')
+def preview(sid: str, slice_index: int, channel: int = 0, aligned: bool = False):
+    if sid not in DATA: raise HTTPException(404, '画像セッションがありません')
+    s = DATA[sid]; data = s.get('aligned') if aligned else s['data']
+    if data is None: raise HTTPException(400, '先に位置合わせを実行してください')
+    if not (0 <= slice_index < data.shape[0] and 0 <= channel < data.shape[1]): raise HTTPException(400, 'スライスまたはチャンネルが範囲外です')
+    encoded = png_data(data[slice_index, channel]).split(',', 1)[1]
+    return Response(base64.b64decode(encoded), media_type='image/png')
 
 @app.get('/api/export/{sid}')
 def export(sid: str):
