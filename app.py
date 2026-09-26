@@ -17,7 +17,7 @@ DATA: dict[str, dict[str, Any]] = {}
 app = FastAPI(title='BrainAligner')
 
 def natural_key(value: str):
-    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r'(\d+)', value)]
+    return [(1, int(part)) if part.isdigit() else (0, part.casefold()) for part in re.split(r'(\d+)', value)]
 
 def to_zcyx(arr: np.ndarray, axes: str) -> np.ndarray:
     axes = axes.upper()
