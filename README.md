@@ -1,18 +1,14 @@
 # BrainAligner
 
-Multi-channel TIFF / OME-TIFF serial section alignment in a browser. The review workflow is inspired by [AlignRef](https://github.com/SatoruMuro/AlignRef).
+Multi-channel TIFF / OME-TIFF serial section alignment in a browser.
 
-## Live app
-
-[Open BrainAligner](https://brain-aligner.onrender.com/)
-
-> Prototype: registration currently uses OpenCV ECC rigid alignment. It does not include AI brain segmentation or non-rigid registration. Review results before research use.
+> Prototype: registration currently uses rigid normalized cross-correlation alignment. It does not include AI brain segmentation or non-rigid registration. Review results before research use.
 
 ## Quick start
 
 ```powershell
 py -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python -m uvicorn app:app --reload
 ```
@@ -32,3 +28,6 @@ Render assigns an `onrender.com` URL after deployment. Uploading TIFFs to a host
 Choose a directory containing `.tif` / `.tiff` files. Files are sorted by relative path and concatenated as serial slices. Different image dimensions are centered on a common canvas; differing data types are promoted to a shared type. Channel counts must match.
 
 See [local implementation notes](README.local.md) for details and limitations.
+
+
+
