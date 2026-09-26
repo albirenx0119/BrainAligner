@@ -4,6 +4,10 @@ Multi-channel TIFF / OME-TIFF serial section alignment in a browser.
 
 > Prototype: registration currently uses rigid normalized cross-correlation alignment. It does not include AI brain segmentation or non-rigid registration. Review results before research use.
 
+## Live app
+
+[BrainAligner を開く](https://brain-aligner.onrender.com/)
+
 ## Quick start
 
 ```powershell
@@ -28,6 +32,8 @@ Render assigns an `onrender.com` URL after deployment. Uploading TIFFs to a host
 Choose a directory containing `.tif` / `.tiff` files. Files are sorted by relative path and concatenated as serial slices. Different image dimensions are centered on a common canvas; differing data types are promoted to a shared type. Channel counts must match.
 
 See [local implementation notes](README.local.md) for details and limitations.
+
+
 
 
 
