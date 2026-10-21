@@ -2,4 +2,6 @@ __pycache__/
 .venv/
 *.py[cod]
 .env
-
+*.log
+*.partial
+.test-*/

@@ -1,39 +1,107 @@
-# BrainAligner
+# BrainAligner Desktop
 
-Multi-channel TIFF / OME-TIFF serial section alignment in a browser.
+連続した組織切片画像を、平行移動と回転で位置合わせするPython製デスクトップアプリです。画像の読み込み、計算、プレビュー、手動補正、保存をすべて使用中のPCで行います。ブラウザ、Webサーバー、Renderは使いません。
 
-> Prototype: registration currently uses rigid normalized cross-correlation alignment. It does not include AI brain segmentation or non-rigid registration. Review results before research use.
+## Windowsでの起動
 
-## Live app
+Python 3.12以降をインストールし、このフォルダの **start.cmd** をダブルクリックしてください。初回は仮想環境を作り、必要なライブラリをインストールします。以降はその環境でGUIを開きます。既存の環境に必要なライブラリがそろっていれば、インストール処理はありません。
 
-[BrainAligner を開く](https://brain-aligner.onrender.com/)
+初回のライブラリ取得時にはインターネット接続が必要です。インストール後の画像処理・保存にはインターネット接続は不要です。
 
-## Quick start
+PowerShellから起動する場合:
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m uvicorn app:app --reload
+cd "BrainAlignerを配置したフォルダ"
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-Open <http://127.0.0.1:8000>.
+すでにセットアップ済みの場合、最後の1行だけで起動できます。仮想環境のActivateやPowerShellの実行ポリシー変更は不要です。
 
-## Deploy
+## 対応画像
 
-A [Render Blueprint](render.yaml) is included. After pushing this repository, click to create the web service in your Render account:
+- PNG、JPEG、単一ページTIFF。画像を複数選択するか、フォルダを選択します。
+- フォルダ選択ではサブフォルダも検索し、相対パスとファイル名を数字順に並べます。例: image1、image2、image10。
+- 1切片につき1ファイルを用意してください。**複数ページTIFF、OME-TIFF、ピラミッドTIFFは読み込めません。** フォルダ内に含まれる場合もエラーを表示し、現在の作業を維持します。
+- TIFFは符号なし8-bit / 16-bitのグレースケール、または3成分RGBに対応します。strip形式、interleaved、左上原点が対象です。signed / float、追加チャンネル、planar separate、tiled形式は非対応です。圧縮形式はインストールされたOpenCVのTIFFデコーダーに依存します。
+- RGBのRed / Green / Blueは1枚の画像内の色成分です。任意の多層免疫染色チャンネルを読み込む機能はありません。
+- 16-bit TIFFは固定値域で `round(value / 257)` により8-bitへ変換し、表示・整列・保存に使用します。自動コントラスト調整は行いません。出力から16-bit精度を復元できないため、元画像は保管してください。
+- 透明PNGは白背景に合成して読み込みます。
+- サイズの異なる画像は拡大縮小せず、最大幅・高さの共通キャンバスの中央に置きます。差が奇数の場合、余白は右・下が1画素多くなります。
+- 画像・出力キャンバスの上限は1辺32,767画素、合計100MPです。実際に扱えるサイズはPCの空きメモリにも依存します。
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/albirenx0119/BrainAligner)
+## 基本操作
 
-Render assigns an `onrender.com` URL after deployment. Uploading TIFFs to a hosted version sends them to that hosting service for processing. This prototype keeps uploads in application memory and does not write them to disk.
+1. **画像を選択** または **フォルダを選択** で画像を読み込み、一覧と切片順序を確認します。
+2. **チャンネル** をGray / Red / Green / Blueから選びます。基準切片はMiddle（中央、偶数枚では後ろ側の中央）またはCurrent（表示中の切片）です。
+3. 計算用画像の最大辺を512 / 768 / 1024 / 1536から選び、**位置合わせを実行** を押します。初期値は768です。これは計算用の縮小サイズで、出力画像のサイズは変更しません。
+4. Before / After、Previous / Nextの重ね合わせ、透明度、交互表示を使って全切片を確認します。NCCの値と警告も確認してください。
+5. 必要な範囲を手動補正し、切り抜きや余白を設定します。
+6. **フォルダへ保存** または **ZIPへ保存** で8-bit PNG / JPEGと `transforms.json` を保存します。
 
-## Folder import
+## 自動位置合わせ
 
-Choose a directory containing `.tif` / `.tiff` files. Files are sorted by relative path and concatenated as serial slices. Different image dimensions are centered on a common canvas; differing data types are promoted to a shared type. Channel counts must match.
+平行移動X・Yと回転角度の3つだけを探索する剛体位置合わせです。基準切片から前後それぞれに向かって隣接ペアを整列し、変換を累積します。選んだチャンネルで求めた1つの変換をRGB全成分に共通適用します。
 
-See [local implementation notes](README.local.md) for details and limitations.
+画像の縮小ピラミッド、背景からのコントラスト重心、複数の移動・角度候補を使って初期位置を探します。人工的な余白を除いた領域の正規化相互相関（NCC）が高くなるよう、座標降下法で段階的に細かく調整します。初期角度候補は−30°から30°、局所探索の上限は±40°です。
 
+相関が0.35未満の隣接ペアは失敗とし、親切片の自動変換を引き継いで警告します。その後に続く切片にも警告を付けます。0.7未満の成功ペアにも確認を促します。全ペア失敗または処理中止では、それまでの変換を維持します。再実行では自動変換を更新し、適用済みの手動補正は保持します。
 
+高い相関でも解剖学的な対応が保証されるわけではありません。形状変化、欠損、低コントラストなどがある切片は重ね合わせで確認してください。
 
+元ファイルを書き換えず、変換行列を記録します。プレビューと保存時には元画像の8-bit表現から合成済みの変換を1回適用します。拡大縮小・せん断・局所変形は自動位置合わせに含みません。回転や小数画素の移動に伴う画素補間は行います。
 
+## 手動補正
 
+1. 補正する切片へ移動し、前後画像を重ねて **記録開始** を押します。
+2. WASDまたは矢印キーで1画素ずつ移動し、Q / Eで0.1°ずつ回転します。Shift併用で10倍です。回転の中心は現在の出力範囲の中央です。
+3. **記録終了** で補正量を保存します。この時点では画像には適用せず、移動・回転のプレビューが消えます。
+4. 対象の切片へ移動して **現在をStartに設定** / **現在をEndに設定** を押します。記録終了直後は両端とも記録した切片です。
+5. 適用範囲を確認し、**指定範囲に移動・回転を適用** を1回押します。
+
+StartとEndを含む範囲に同じ補正を適用します。Start=Endなら1枚だけです。逆順でも両端間の全切片が対象になります。適用ボタンを再び押すと補正が重なります。UndoまたはCtrl+Zで戻してください。記録中は切片移動を固定します。
+
+## 表示・切り抜き
+
+| 操作 | 動作 |
+| --- | --- |
+| F / R、左右キー、番号入力、一覧選択 | 次 / 前 / 指定切片へ移動 |
+| Viewer上のホイール | 切片を移動 |
+| Ctrl + ホイール | 拡大縮小 |
+| Viewerをドラッグ | 表示を移動 |
+| Fit | 表示位置と倍率をリセット |
+| Ctrl + Z / Undo | 直前の変更を取り消し（最大50操作） |
+
+**切り抜き選択** を押してViewer上をドラッグするか、X / Y / W / Hを入力して **切り抜きを適用** を押します。座標は共通キャンバス上の元解像度の画素単位です。全切片で共通の出力範囲になります。切り抜きを戻す操作は出力範囲だけを戻し、その後の位置合わせ補正は保持します。
+
+**四辺に100 pxずつ余白を追加** で出力範囲を広げられます。元画像は拡大縮小しません。
+
+## 保存と作業再開
+
+- 保存先に日時付きの新しいフォルダまたはZIPを作り、既存ファイルを上書きしません。
+- 保存される画像は8-bit RGB PNG / JPEGです。TIFF / OME-TIFF出力はありません。物理的な画素間隔やICC/EXIFなどのメタデータは引き継ぎません。
+- `transforms.json` に画像順序・サイズ、計算条件、各切片の自動変換・手動変換・最終変換、QC、出力範囲を記録します。元画像自体は含みません。
+- **変換JSONを保存** で設定だけを保存できます。再開時には対応する元画像を同じ順に読み込み、**変換JSONを読込** を使用します。
+- 対応付けは切片順とサイズで検査します。別の画像・チャンネルへ変換を移す場合、同じ切片が同じ順序・同じサイズでそろっていることを確認してください。
+- 中止したフォルダ書き出しには、作成済み画像と `INCOMPLETE.txt` が残ります。完了時はこの印を削除し、変換JSONを保存します。中止したZIPは保存しません。
+- 自動保存はありません。終了前に画像または変換JSONを保存してください。
+
+## 動作環境と構成
+
+Windows、Python 3.12以降、Tkinter（Windows版Pythonに付属）、NumPy、OpenCV、Pillow、tifffileを使用します。CPUで計算し、GPUは必須ではありません。整列と保存はバックグラウンド処理で実行し、**処理を中止** で停止できます。
+
+- `app.py`: デスクトップGUI
+- `registration.py`: 剛体整列と相関計算
+- `image_io.py`: 入力検査・画像キャッシュ・プレビュー
+- `project.py`: 変換状態・Undo・JSON・画像出力
+- `start.cmd` / `launch.py`: Windows用起動処理
+- `tests/test_workflow.py`: 入力制限・整列・変換・保存の検証
+
+起動に失敗した場合は `startup-error.log`、処理エラーは `brainaligner.log` を確認してください。コンソールで `.\.venv\Scripts\python.exe app.py` を実行すると、起動時の例外を確認できます。
+
+開発用の検証:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
